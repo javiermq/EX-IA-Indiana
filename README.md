@@ -215,12 +215,12 @@ python -m src.indiana_xray.train_qwen_explainability \
   --gradcam-dir runs/gradcam_full_e10 \
   --out-dir runs/qwen_explainability_e10 \
   --model-id Qwen/Qwen2.5-1.5B \
-  --epochs 10 \
+  --epochs 20 \
   --batch-size 2 \
   --device cuda \
   --dtype float16 \
-  --clip-weight 1.0 \
-  --next-token-weight 0.25 \
+  --clip-weight 0.5 \
+  --next-token-weight 0.5 \
   --prefix-len 8
 ```
 

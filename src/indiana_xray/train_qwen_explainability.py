@@ -83,10 +83,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix-len", type=int, default=8)
     parser.add_argument("--clip-weight", type=float, default=1.0)
     parser.add_argument("--next-token-weight", type=float, default=0.25)
+    parser.add_argument("--eval-examples", type=int, default=3)
+    parser.add_argument("--eval-max-new-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
     return parser.parse_args()
+
+
+def clean_prediction(text: str) -> str:
+    text = " ".join(text.replace("\n", " ").split()).strip()
+    if not text:
+        return "<empty>"
+    if "." in text:
+        text = text.split(".")[0].strip() + "."
+    return text
 
 
 def dtype_from_name(name: str, device: torch.device) -> torch.dtype:
@@ -240,6 +251,49 @@ def retrieval_metrics(
     }
 
 
+@torch.no_grad()
+def print_eval_examples(
+    loader: DataLoader,
+    densenet: DenseNetClassifier,
+    qwen: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prefix_projector: VisualPrefixProjector,
+    gradcam_mapping: dict[str, np.ndarray],
+    gradcam_dim: int,
+    device: torch.device,
+    max_examples: int,
+    max_new_tokens: int,
+) -> None:
+    if max_examples <= 0:
+        return
+    prefix_projector.eval()
+    shown = 0
+    print("eval_examples:")
+    for batch in loader:
+        images = batch["image"].to(device)
+        _, visual, _ = densenet(images)
+        gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
+        prefix = prefix_projector(visual.float(), gradcam).to(dtype=qwen.get_input_embeddings().weight.dtype)
+        attention_mask = torch.ones(prefix.shape[:2], dtype=torch.long, device=device)
+        generated = qwen.generate(
+            inputs_embeds=prefix,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        for image_id, gt, pred in zip(batch["image_id"], batch["next_token_text"], decoded):
+            print(f"  image_id: {image_id}")
+            print(f"    gt:   {gt}")
+            print(f"    pred: {clean_prediction(pred)}")
+            shown += 1
+            if shown >= max_examples:
+                return
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -335,6 +389,18 @@ def main() -> None:
             f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
             f"test_loss={test_losses['loss']:.4f} r@1={retrieval['retrieval_r1']:.4f} "
             f"r@5={retrieval['retrieval_r5']:.4f} nt={test_losses['next_token_loss']:.4f}"
+        )
+        print_eval_examples(
+            test_loader,
+            densenet,
+            qwen,
+            tokenizer,
+            prefix_projector,
+            gradcam_mapping,
+            gradcam_dim,
+            device,
+            args.eval_examples,
+            args.eval_max_new_tokens,
         )
         score = retrieval["retrieval_r5"]
         if score > best_score:
