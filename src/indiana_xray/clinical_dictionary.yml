@@ -1,0 +1,62 @@
+normal:
+  canonical: normal
+  synonyms:
+    - no acute cardiopulmonary abnormality
+    - no acute disease
+    - no active disease
+    - normal chest
+atelectasis:
+  canonical: atelectasis
+  synonyms:
+    - atelectatic
+    - subsegmental atelectasis
+cardiomegaly:
+  canonical: cardiomegaly
+  synonyms:
+    - enlarged heart
+    - heart size enlarged
+    - cardiac enlargement
+consolidation:
+  canonical: consolidation
+  synonyms:
+    - airspace consolidation
+edema:
+  canonical: edema
+  synonyms:
+    - pulmonary edema
+    - vascular congestion
+    - interstitial edema
+pleural_effusion:
+  canonical: pleural_effusion
+  synonyms:
+    - pleural effusion
+    - effusion
+    - blunting
+pneumonia:
+  canonical: pneumonia
+  synonyms:
+    - infiltrate suspicious for pneumonia
+pneumothorax:
+  canonical: pneumothorax
+  synonyms:
+    - apical pneumothorax
+emphysema:
+  canonical: emphysema
+  synonyms:
+    - hyperinflation
+    - hyperexpanded
+nodule:
+  canonical: nodule
+  synonyms:
+    - nodular opacity
+    - pulmonary nodule
+opacity:
+  canonical: opacity
+  synonyms:
+    - airspace opacity
+    - opacification
+infiltrate:
+  canonical: infiltrate
+  synonyms:
+    - infiltrates
+    - interstitial infiltrate

@@ -1,0 +1,37 @@
+# Local datasets and generated artifacts
+data/
+runs/
+outputs/
+checkpoints/
+
+# Model weights and large tensor artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.parquet
+*.tgz
+*.tar
+*.tar.gz
+*.zip
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Notebooks and local runtime noise
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
