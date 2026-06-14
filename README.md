@@ -198,11 +198,55 @@ Metricas principales:
 - `median_deletion_drop_top20`: mediana de esa caida.
 - `mean_refined_attention_mse`: distancia media entre atencion refinada y Grad-CAM.
 
-## 7. Ver resultados
+## 7. Entrenar Qwen para explicabilidad
+
+Este paso usa `indiana_synthetic_v3.tsv`, DenseNet y Grad-CAM para aprender una conexion explicativa visual-textual. Qwen queda congelado: no se anaden tokens y no se genera texto durante el entrenamiento.
+
+Se entrenan solo:
+
+- proyector visual para CLIP loss;
+- proyector de prefijo visual para next-token loss;
+- temperatura contrastiva.
+
+```bash
+python -m src.indiana_xray.train_qwen_explainability \
+  --synthetic-tsv data/indiana/indiana_synthetic_v3.tsv \
+  --densenet-checkpoint runs/densenet_full_e10/best.pt \
+  --gradcam-dir runs/gradcam_full_e10 \
+  --out-dir runs/qwen_explainability_e10 \
+  --model-id Qwen/Qwen2.5-1.5B \
+  --epochs 10 \
+  --batch-size 2 \
+  --device cuda \
+  --dtype float16 \
+  --clip-weight 1.0 \
+  --next-token-weight 0.25 \
+  --prefix-len 8
+```
+
+Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`.
+
+Salidas:
+
+```text
+runs/qwen_explainability_e10/best.pt
+runs/qwen_explainability_e10/metrics.json
+```
+
+Metricas principales:
+
+- `retrieval_r1`
+- `retrieval_r5`
+- `median_rank`
+- `positive_cosine`
+- `next_token_loss`
+
+## 8. Ver resultados
 
 ```bash
 cat runs/densenet_full/metrics.json
 cat runs/gradcam_full/metrics.json
+cat runs/qwen_explainability_e10/metrics.json
 ```
 
 En Windows PowerShell:
@@ -210,10 +254,11 @@ En Windows PowerShell:
 ```powershell
 Get-Content runs\densenet_full\metrics.json
 Get-Content runs\gradcam_full\metrics.json
+Get-Content runs\qwen_explainability_e10\metrics.json
 ```
 
 ## Nota sobre Qwen
 
-`Qwen/Qwen2.5-1.5B` y `Qwen/Qwen2.5-1.5B-Instruct` pesan varios GB. En este README, Qwen solo se usa de forma opcional para generar `indiana_synthetic.tsv` offline.
+`Qwen/Qwen2.5-1.5B` y `Qwen/Qwen2.5-1.5B-Instruct` pesan varios GB. En este README, `Qwen/Qwen2.5-1.5B-Instruct` se usa para generar `indiana_synthetic.tsv` offline y `Qwen/Qwen2.5-1.5B` se usa congelado para la fase de explicabilidad.
 
-Cuando se retome la fase contrastiva, la idea sera mantener Qwen congelado inicialmente, sin anadir tokens. El texto de entrenamiento podra venir de `clip_text` y `next_token_text`.
+La fase de explicabilidad mantiene Qwen congelado inicialmente, sin anadir tokens. El texto de entrenamiento viene de `clip_text` y `next_token_text`.
