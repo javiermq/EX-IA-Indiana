@@ -68,7 +68,7 @@ Este archivo anade conceptos normalizados por imagen y columnas multilabel `labe
 
 Este paso es opcional. Sirve para crear una frase breve y densa con las anomalias relevantes de cada informe. Esa frase puede usarse mas adelante como texto para CLIP loss y next-token loss.
 
-El prompt fuerza una salida de maximo 15 palabras, solo con hallazgos radiograficos visibles y localizaciones. No debe incluir recomendaciones, follow-up, correlacion clinica, fechas, comparaciones ni metadatos.
+El prompt fuerza una salida de maximo 12 palabras, solo con hallazgos radiograficos visibles y localizaciones. Usa el informe como fuente principal y los conceptos debiles como pistas. No debe incluir recomendaciones, follow-up, correlacion clinica, fechas, comparaciones, metadatos, tubos, cateteres, lineas, clips, puertos, marcapasos ni hardware salvo que sean el hallazgo principal.
 
 El modelo recomendado para esta destilacion textual offline es `Qwen/Qwen2.5-1.5B-Instruct`, porque debe seguir una instruccion de resumen clinico. El alineamiento posterior puede seguir usando `Qwen/Qwen2.5-1.5B` congelado si se quiere mantener la arquitectura original.
 
@@ -98,6 +98,19 @@ python -m src.indiana_xray.generate_synthetic_text \
   --resume
 ```
 
+Si se quiere usar un generador mas potente con menos VRAM, se puede cargar Qwen 7B en 4-bit:
+
+```bash
+python -m src.indiana_xray.generate_synthetic_text \
+  --input-tsv data/indiana/indiana_concepts.tsv \
+  --out-tsv data/indiana/indiana_synthetic_v4_qwen7b.tsv \
+  --model-id Qwen/Qwen2.5-7B-Instruct \
+  --batch-size 1 \
+  --device cuda \
+  --dtype float16 \
+  --load-in-4bit
+```
+
 Columnas nuevas:
 
 ```text
@@ -122,7 +135,7 @@ Si ya existe un TSV generado con una version anterior del prompt, vuelve a gener
 ```bash
 python -m src.indiana_xray.generate_synthetic_text \
   --input-tsv data/indiana/indiana_concepts.tsv \
-  --out-tsv data/indiana/indiana_synthetic_v2.tsv \
+  --out-tsv data/indiana/indiana_synthetic_v4.tsv \
   --model-id Qwen/Qwen2.5-1.5B-Instruct \
   --batch-size 8 \
   --device cuda \
@@ -200,7 +213,7 @@ Metricas principales:
 
 ## 7. Entrenar Qwen para explicabilidad
 
-Este paso usa `indiana_synthetic_v3.tsv`, DenseNet y Grad-CAM para aprender una conexion explicativa visual-textual. Qwen queda congelado: no se anaden tokens y no se genera texto durante el entrenamiento.
+Este paso usa `indiana_synthetic_v4.tsv`, DenseNet y Grad-CAM para aprender una conexion explicativa visual-textual. Qwen queda congelado: no se anaden tokens y no se genera texto durante el entrenamiento.
 
 Se entrenan solo:
 
@@ -210,7 +223,7 @@ Se entrenan solo:
 
 ```bash
 python -m src.indiana_xray.train_qwen_explainability \
-  --synthetic-tsv data/indiana/indiana_synthetic_v3.tsv \
+  --synthetic-tsv data/indiana/indiana_synthetic_v4.tsv \
   --densenet-checkpoint runs/densenet_full_e10/best.pt \
   --gradcam-dir runs/gradcam_full_e10 \
   --out-dir runs/qwen_explainability_e10 \
@@ -221,7 +234,9 @@ python -m src.indiana_xray.train_qwen_explainability \
   --dtype float16 \
   --clip-weight 0.5 \
   --next-token-weight 0.5 \
-  --prefix-len 8
+  --prefix-len 8 \
+  --eval-examples 6 \
+  --eval-random-examples
 ```
 
 Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`.

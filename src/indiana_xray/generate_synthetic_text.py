@@ -7,14 +7,28 @@ from pathlib import Path
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .utils import ensure_dir, pick_device
 
 
-PROMPT_VERSION = "synthetic_anomaly_v3"
+PROMPT_VERSION = "synthetic_anomaly_v4"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 NORMAL_SENTENCE = "No acute cardiopulmonary abnormality."
+GENERIC_CONCEPTS = {"normal", "chest_xray", "lungs", "heart", "pleura", "mediastinum", "thorax"}
+CONCEPT_TEXT = {
+    "atelectasis": "atelectasis",
+    "cardiomegaly": "cardiomegaly",
+    "consolidation": "consolidation",
+    "edema": "pulmonary edema",
+    "pleural_effusion": "pleural effusion",
+    "pneumonia": "pneumonia",
+    "pneumothorax": "pneumothorax",
+    "emphysema": "emphysema",
+    "nodule": "pulmonary nodule",
+    "opacity": "pulmonary opacity",
+    "infiltrate": "pulmonary infiltrate",
+}
 FORBIDDEN_PATTERNS = [
     r"\brecommend(?:ed|s|ation)?\b.*",
     r"\bfollow[- ]?up\b.*",
@@ -35,11 +49,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default=None)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
+    parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--limit", type=int, default=None, help="Optional small debug subset.")
     parser.add_argument("--resume", action="store_true", help="Reuse existing rows in out-tsv by image_id.")
     return parser.parse_args()
+
+
+def quantization_config(args: argparse.Namespace, dtype: torch.dtype) -> BitsAndBytesConfig | None:
+    if not args.load_in_4bit:
+        return None
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
 
 
 def dtype_from_name(name: str, device: torch.device) -> torch.dtype:
@@ -60,12 +86,34 @@ def clean_report_text(*parts: object) -> str:
     return text
 
 
-def build_prompt(report_text: str) -> str:
+def abnormal_concepts(row: dict[str, object]) -> list[str]:
+    concepts = [c for c in str(row.get("concepts", "")).split("|") if c]
+    concepts = [c for c in concepts if c not in GENERIC_CONCEPTS]
+    ordered = []
+    for concept in concepts:
+        if concept not in ordered:
+            ordered.append(concept)
+    return ordered
+
+
+def concepts_to_text(concepts: list[str], max_items: int = 4) -> str:
+    terms = [CONCEPT_TEXT.get(c, c.replace("_", " ")) for c in concepts[:max_items]]
+    if not terms:
+        return ""
+    if len(terms) == 1:
+        return terms[0].capitalize() + "."
+    return ", ".join(terms[:-1]).capitalize() + f", and {terms[-1]}."
+
+
+def build_prompt(report_text: str, candidate_text: str) -> str:
+    hints = candidate_text or "none"
     return (
         "Extract only radiographic chest xray findings from the report.\n"
         "Write one complete noun phrase in English with a maximum of 12 words.\n"
-        f"If there is no abnormality, write exactly: {NORMAL_SENTENCE}\n"
+        f"Candidate abnormality hints from weak labels: {hints}.\n"
+        f"If the report and hints contain no abnormality, write exactly: {NORMAL_SENTENCE}\n"
         "Mention only visible abnormalities and locations.\n"
+        "If weak labels suggest an abnormality and the report supports it, include it.\n"
         "Do not mention tubes, catheters, lines, clips, ports, pacemakers, or hardware unless they are the primary finding.\n"
         "Do not mention recommendations, follow-up, clinical correlation, uncertainty management, patient data, dates, comparisons, placeholders, or report metadata.\n"
         "Do not invent findings.\n\n"
@@ -93,6 +141,13 @@ def normalize_generation(text: str) -> str:
     if text[-1] not in ".!?":
         text += "."
     return text
+
+
+def apply_abnormal_fallback(sentence: str, concepts: list[str]) -> str:
+    if sentence == NORMAL_SENTENCE and concepts:
+        fallback = concepts_to_text(concepts)
+        return fallback or sentence
+    return sentence
 
 
 def load_existing(path: Path) -> dict[str, str]:
@@ -149,7 +204,15 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype).to(device)
+    qconfig = quantization_config(args, dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        torch_dtype=dtype,
+        quantization_config=qconfig,
+        device_map="auto" if qconfig is not None else None,
+    )
+    if qconfig is None:
+        model = model.to(device)
     model.eval()
 
     rows: list[dict[str, object]] = []
@@ -163,9 +226,11 @@ def main() -> None:
             row.get("indication", ""),
         )
         out = dict(row)
+        concepts = abnormal_concepts(row)
+        candidate_text = ", ".join(CONCEPT_TEXT.get(c, c.replace("_", " ")) for c in concepts)
         out["report_text_clean"] = report_text_clean
         if image_id in existing and existing[image_id]:
-            sentence = normalize_generation(existing[image_id])
+            sentence = apply_abnormal_fallback(normalize_generation(existing[image_id]), concepts)
             out["synthetic_anomaly_text"] = sentence
             out["clip_text"] = f"Chest xray: {sentence}"
             out["next_token_text"] = sentence
@@ -173,13 +238,14 @@ def main() -> None:
             out["synthetic_prompt_version"] = PROMPT_VERSION
             rows.append(out)
             continue
-        pending.append((idx, out, build_prompt(report_text_clean)))
+        pending.append((idx, out, build_prompt(report_text_clean, candidate_text), concepts))
 
     for start in tqdm(range(0, len(pending), args.batch_size), desc="Generating synthetic text"):
         batch = pending[start : start + args.batch_size]
         prompts = [item[2] for item in batch]
         sentences = generate_batch(model, tokenizer, prompts, device, args.max_new_tokens)
-        for (_, out, _), sentence in zip(batch, sentences):
+        for (_, out, _, concepts), sentence in zip(batch, sentences):
+            sentence = apply_abnormal_fallback(sentence, concepts)
             out["synthetic_anomaly_text"] = sentence
             out["clip_text"] = f"Chest xray: {sentence}"
             out["next_token_text"] = sentence
