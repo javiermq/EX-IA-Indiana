@@ -223,7 +223,7 @@ Se entrenan solo:
 
 ```bash
 python -m src.indiana_xray.train_qwen_explainability \
-  --synthetic-tsv data/indiana/indiana_synthetic_v4.tsv \
+  --synthetic-tsv data/indiana/indiana_synthetic_v4_qwen7b.tsv \
   --densenet-checkpoint runs/densenet_full_e10/best.pt \
   --gradcam-dir runs/gradcam_full_e10 \
   --out-dir runs/qwen_explainability_e10 \
