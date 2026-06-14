@@ -110,7 +110,7 @@ Este archivo anade conceptos normalizados por imagen y columnas multilabel `labe
 
 Este paso es opcional. Sirve para crear una frase breve y densa con las anomalias relevantes de cada informe. Esa frase puede usarse mas adelante como texto para CLIP loss y next-token loss.
 
-El prompt fuerza una salida de maximo 12 palabras, solo con hallazgos radiograficos visibles y localizaciones. Usa el informe como fuente principal y los conceptos debiles como pistas. No debe incluir recomendaciones, follow-up, correlacion clinica, fechas, comparaciones, metadatos, tubos, cateteres, lineas, clips, puertos, marcapasos ni hardware salvo que sean el hallazgo principal.
+El prompt fuerza una salida de maximo 12 palabras, solo con hallazgos radiograficos visibles y localizaciones. Usa el informe como fuente principal, los conceptos debiles como pistas y una lista precomputada de 20-30 keywords clinicas del propio informe, sin articulos ni stopwords. No debe incluir recomendaciones, follow-up, correlacion clinica, fechas, comparaciones, metadatos, tubos, cateteres, lineas, clips, puertos, marcapasos ni hardware salvo que sean el hallazgo principal.
 
 El modelo recomendado para esta destilacion textual offline es `Qwen/Qwen2.5-1.5B-Instruct`, porque debe seguir una instruccion de resumen clinico. El alineamiento posterior puede seguir usando `Qwen/Qwen2.5-1.5B` congelado si se quiere mantener la arquitectura original.
 
@@ -150,7 +150,8 @@ python -m src.indiana_xray.generate_synthetic_text \
   --batch-size 1 \
   --device cuda \
   --dtype float16 \
-  --load-in-4bit
+  --load-in-4bit \
+  --keyword-count 30
 ```
 
 Columnas nuevas:
@@ -160,11 +161,12 @@ report_text_clean
 synthetic_anomaly_text
 clip_text
 next_token_text
+prompt_keywords
 synthetic_model
 synthetic_prompt_version
 ```
 
-Alternativa controlada, recomendada si el next-token empieza a inventar variantes raras o no converge:
+Alternativa cerrada para ablation, util si quieres medir el techo de convergencia con vocabulario fijo y sin generacion abierta:
 
 ```bash
 python -m src.indiana_xray.make_controlled_synthetic_text \
@@ -175,7 +177,7 @@ python -m src.indiana_xray.make_controlled_synthetic_text \
   --max-terms-per-image 3
 ```
 
-Esta version no usa generacion abierta. Primero cuenta los hallazgos mas comunes en `label_*`/`concepts`, mantiene un vocabulario cerrado y genera frases canonicas cortas como `Cardiomegaly and pleural effusion.`. Es menos expresiva, pero mucho mas estable para entrenar `clip_text` + `next_token_text`.
+Esta version no usa generacion abierta. Primero cuenta los hallazgos mas comunes en `label_*`/`concepts`, mantiene un vocabulario cerrado y genera frases canonicas cortas como `Cardiomegaly and pleural effusion.`. Sirve como comparativa, pero el flujo principal recomendado es Qwen guiado por `prompt_keywords`.
 
 Ejemplo de salida esperada:
 

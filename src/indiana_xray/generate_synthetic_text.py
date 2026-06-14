@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from .utils import ensure_dir, pick_device
 
 
-PROMPT_VERSION = "synthetic_anomaly_v4"
+PROMPT_VERSION = "synthetic_anomaly_v5_keyword_guided"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 NORMAL_SENTENCE = "No acute cardiopulmonary abnormality."
 GENERIC_CONCEPTS = {"normal", "chest_xray", "lungs", "heart", "pleura", "mediastinum", "thorax"}
@@ -38,6 +38,124 @@ FORBIDDEN_PATTERNS = [
     r"\bshould be considered\b.*",
     r"\b(?:tube|catheter|line|clip|clips|hardware|port|pacemaker|sternotomy wire|surgical suture)\b.*",
 ]
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "no",
+    "not",
+    "of",
+    "on",
+    "or",
+    "the",
+    "there",
+    "to",
+    "was",
+    "were",
+    "with",
+    "without",
+}
+RADIOLOGY_KEYWORDS = {
+    "acute",
+    "airspace",
+    "apical",
+    "atelectasis",
+    "bibasilar",
+    "bilateral",
+    "blunting",
+    "calcified",
+    "cardiac",
+    "cardiomegaly",
+    "chronic",
+    "clear",
+    "consolidation",
+    "edema",
+    "effusion",
+    "emphysema",
+    "enlarged",
+    "granuloma",
+    "granulomatous",
+    "heart",
+    "hilar",
+    "hyperinflation",
+    "hyperinflated",
+    "infiltrate",
+    "interstitial",
+    "left",
+    "lobe",
+    "lower",
+    "lung",
+    "lungs",
+    "mild",
+    "moderate",
+    "nodule",
+    "nodular",
+    "opacity",
+    "opacities",
+    "perihilar",
+    "pleural",
+    "pneumonia",
+    "pneumothorax",
+    "pulmonary",
+    "right",
+    "scarring",
+    "small",
+    "subsegmental",
+    "upper",
+}
+NEGATION_TERMS = {"no", "without", "negative", "absent", "absence", "free"}
+NEGATION_WINDOW = 7
+CLINICAL_PHRASES = [
+    "airspace opacity",
+    "airspace consolidation",
+    "apical pneumothorax",
+    "bibasilar opacities",
+    "calcified granuloma",
+    "cardiac enlargement",
+    "chronic scarring",
+    "enlarged heart",
+    "granulomatous changes",
+    "heart size enlarged",
+    "interstitial edema",
+    "interstitial infiltrate",
+    "left lower lobe",
+    "left upper lobe",
+    "nodular opacity",
+    "pleural effusion",
+    "pulmonary edema",
+    "pulmonary infiltrate",
+    "pulmonary nodule",
+    "right lower lobe",
+    "right upper lobe",
+    "subsegmental atelectasis",
+    "vascular congestion",
+]
+CONCEPT_PHRASES = {
+    "atelectasis": ["atelectasis", "atelectatic", "subsegmental atelectasis"],
+    "cardiomegaly": ["cardiomegaly", "enlarged heart", "heart size enlarged", "cardiac enlargement"],
+    "consolidation": ["consolidation", "airspace consolidation"],
+    "edema": ["edema", "pulmonary edema", "vascular congestion", "interstitial edema"],
+    "pleural_effusion": ["pleural effusion", "effusion", "blunting"],
+    "pneumonia": ["pneumonia"],
+    "pneumothorax": ["pneumothorax", "apical pneumothorax"],
+    "emphysema": ["emphysema", "hyperinflation", "hyperinflated", "hyperexpanded"],
+    "nodule": ["nodule", "nodular opacity", "pulmonary nodule"],
+    "opacity": ["opacity", "opacities", "airspace opacity", "opacification"],
+    "infiltrate": ["infiltrate", "infiltrates", "interstitial infiltrate"],
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument("--keyword-count", type=int, default=30)
     parser.add_argument("--limit", type=int, default=None, help="Optional small debug subset.")
     parser.add_argument("--resume", action="store_true", help="Reuse existing rows in out-tsv by image_id.")
     return parser.parse_args()
@@ -96,6 +215,30 @@ def abnormal_concepts(row: dict[str, object]) -> list[str]:
     return ordered
 
 
+def is_negated(text: str, start_idx: int) -> bool:
+    prefix = tokenize_keywords(text[:start_idx])
+    if any(token in NEGATION_TERMS for token in prefix[-NEGATION_WINDOW:]):
+        return True
+    clause_start = max(text.rfind(".", 0, start_idx), text.rfind(";", 0, start_idx), text.rfind(":", 0, start_idx))
+    clause = text[clause_start + 1 : start_idx].lower()
+    return bool(re.search(r"\b(?:without|no)\s+(?:evidence\s+of|signs?\s+of|definite\s+)?", clause))
+
+
+def concept_is_only_negated(report_text: str, concept: str) -> bool:
+    phrases = CONCEPT_PHRASES.get(concept, [CONCEPT_TEXT.get(concept, concept.replace("_", " "))])
+    matches: list[bool] = []
+    lowered = report_text.lower()
+    for phrase in phrases:
+        phrase_norm = phrase.lower()
+        for match in re.finditer(rf"\b{re.escape(phrase_norm)}\b", lowered):
+            matches.append(is_negated(lowered, match.start()))
+    return bool(matches) and all(matches)
+
+
+def filter_negated_concepts(report_text: str, concepts: list[str]) -> list[str]:
+    return [concept for concept in concepts if not concept_is_only_negated(report_text, concept)]
+
+
 def concepts_to_text(concepts: list[str], max_items: int = 4) -> str:
     terms = [CONCEPT_TEXT.get(c, c.replace("_", " ")) for c in concepts[:max_items]]
     if not terms:
@@ -105,15 +248,67 @@ def concepts_to_text(concepts: list[str], max_items: int = 4) -> str:
     return ", ".join(terms[:-1]).capitalize() + f", and {terms[-1]}."
 
 
-def build_prompt(report_text: str, candidate_text: str) -> str:
+def tokenize_keywords(text: str) -> list[str]:
+    return re.findall(r"[a-z][a-z/-]*", text.lower())
+
+
+def extract_prompt_keywords(report_text: str, concepts: list[str], max_keywords: int) -> list[str]:
+    lowered = report_text.lower()
+    scores: dict[str, float] = {}
+
+    for concept in concepts:
+        phrase = CONCEPT_TEXT.get(concept, concept.replace("_", " "))
+        for token in tokenize_keywords(phrase):
+            if token not in STOPWORDS:
+                scores[token] = max(scores.get(token, 0.0), 5.0)
+
+    for phrase in CLINICAL_PHRASES:
+        match_positions = [match.start() for match in re.finditer(rf"\b{re.escape(phrase)}\b", lowered)]
+        if match_positions and any(not is_negated(lowered, pos) for pos in match_positions):
+            scores[phrase] = max(scores.get(phrase, 0.0), 4.0)
+            for token in tokenize_keywords(phrase):
+                if token not in STOPWORDS:
+                    scores[token] = max(scores.get(token, 0.0), 3.0)
+
+    for match in re.finditer(r"\b[a-z][a-z/-]*\b", lowered):
+        token = match.group(0)
+        if token in STOPWORDS or len(token) < 3:
+            continue
+        if is_negated(lowered, match.start()):
+            continue
+        if token in RADIOLOGY_KEYWORDS:
+            scores[token] = scores.get(token, 0.0) + 2.0
+        elif token in {concept.replace("_", "-") for concept in concepts}:
+            scores[token] = scores.get(token, 0.0) + 1.5
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    keywords: list[str] = []
+    covered_tokens: set[str] = set()
+    for keyword, _ in ranked:
+        parts = tokenize_keywords(keyword)
+        if len(parts) > 1:
+            keywords.append(keyword)
+            covered_tokens.update(parts)
+        elif keyword not in covered_tokens:
+            keywords.append(keyword)
+        if len(keywords) >= max_keywords:
+            break
+    return keywords
+
+
+def build_prompt(report_text: str, candidate_text: str, prompt_keywords: list[str]) -> str:
     hints = candidate_text or "none"
+    keywords = ", ".join(prompt_keywords) if prompt_keywords else "none"
     return (
         "Extract only radiographic chest xray findings from the report.\n"
         "Write one complete noun phrase in English with a maximum of 12 words.\n"
         f"Candidate abnormality hints from weak labels: {hints}.\n"
+        f"Precomputed report keywords, without stopwords: {keywords}.\n"
         f"If the report and hints contain no abnormality, write exactly: {NORMAL_SENTENCE}\n"
+        "Prefer words from the precomputed keywords when they are clinically relevant.\n"
         "Mention only visible abnormalities and locations.\n"
         "If weak labels suggest an abnormality and the report supports it, include it.\n"
+        "Do not introduce diseases, measurements, or locations absent from the report keywords or report text.\n"
         "Do not mention tubes, catheters, lines, clips, ports, pacemakers, or hardware unless they are the primary finding.\n"
         "Do not mention recommendations, follow-up, clinical correlation, uncertainty management, patient data, dates, comparisons, placeholders, or report metadata.\n"
         "Do not invent findings.\n\n"
@@ -216,7 +411,7 @@ def main() -> None:
     model.eval()
 
     rows: list[dict[str, object]] = []
-    pending: list[tuple[int, dict[str, object], str]] = []
+    pending: list[tuple[int, dict[str, object], str, list[str]]] = []
 
     for idx, row in enumerate(df.to_dict("records")):
         image_id = str(row.get("image_id", idx))
@@ -226,9 +421,11 @@ def main() -> None:
             row.get("indication", ""),
         )
         out = dict(row)
-        concepts = abnormal_concepts(row)
+        concepts = filter_negated_concepts(report_text_clean, abnormal_concepts(row))
         candidate_text = ", ".join(CONCEPT_TEXT.get(c, c.replace("_", " ")) for c in concepts)
+        prompt_keywords = extract_prompt_keywords(report_text_clean, concepts, args.keyword_count)
         out["report_text_clean"] = report_text_clean
+        out["prompt_keywords"] = "|".join(prompt_keywords)
         if image_id in existing and existing[image_id]:
             sentence = apply_abnormal_fallback(normalize_generation(existing[image_id]), concepts)
             out["synthetic_anomaly_text"] = sentence
@@ -238,7 +435,7 @@ def main() -> None:
             out["synthetic_prompt_version"] = PROMPT_VERSION
             rows.append(out)
             continue
-        pending.append((idx, out, build_prompt(report_text_clean, candidate_text), concepts))
+        pending.append((idx, out, build_prompt(report_text_clean, candidate_text, prompt_keywords), concepts))
 
     for start in tqdm(range(0, len(pending), args.batch_size), desc="Generating synthetic text"):
         batch = pending[start : start + args.batch_size]
