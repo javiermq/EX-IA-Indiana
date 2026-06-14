@@ -68,6 +68,8 @@ Este archivo anade conceptos normalizados por imagen y columnas multilabel `labe
 
 Este paso es opcional. Sirve para crear una frase breve y densa con las anomalias relevantes de cada informe. Esa frase puede usarse mas adelante como texto para CLIP loss y next-token loss.
 
+El prompt fuerza una salida de maximo 15 palabras, solo con hallazgos radiograficos visibles y localizaciones. No debe incluir recomendaciones, follow-up, correlacion clinica, fechas, comparaciones ni metadatos.
+
 El modelo recomendado para esta destilacion textual offline es `Qwen/Qwen2.5-1.5B-Instruct`, porque debe seguir una instruccion de resumen clinico. El alineamiento posterior puede seguir usando `Qwen/Qwen2.5-1.5B` congelado si se quiere mantener la arquitectura original.
 
 Prueba pequena:
@@ -113,6 +115,18 @@ Ejemplo de salida esperada:
 synthetic_anomaly_text: Mild cardiomegaly with small left pleural effusion.
 clip_text: Chest xray: Mild cardiomegaly with small left pleural effusion.
 next_token_text: Mild cardiomegaly with small left pleural effusion.
+```
+
+Si ya existe un TSV generado con una version anterior del prompt, vuelve a generarlo sin `--resume` o usa otro nombre de salida, por ejemplo:
+
+```bash
+python -m src.indiana_xray.generate_synthetic_text \
+  --input-tsv data/indiana/indiana_concepts.tsv \
+  --out-tsv data/indiana/indiana_synthetic_v2.tsv \
+  --model-id Qwen/Qwen2.5-1.5B-Instruct \
+  --batch-size 8 \
+  --device cuda \
+  --dtype float16
 ```
 
 ## 5. Entrenar DenseNet121 + MLP residual

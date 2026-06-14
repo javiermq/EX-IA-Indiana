@@ -12,9 +12,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .utils import ensure_dir, pick_device
 
 
-PROMPT_VERSION = "synthetic_anomaly_v1"
+PROMPT_VERSION = "synthetic_anomaly_v2"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 NORMAL_SENTENCE = "No acute cardiopulmonary abnormality."
+FORBIDDEN_PATTERNS = [
+    r"\brecommend(?:ed|s|ation)?\b.*",
+    r"\bfollow[- ]?up\b.*",
+    r"\bcorrelate clinically\b.*",
+    r"\bclinical correlation\b.*",
+    r"\bif clinically indicated\b.*",
+    r"\bshould be considered\b.*",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,10 +61,11 @@ def clean_report_text(*parts: object) -> str:
 
 def build_prompt(report_text: str) -> str:
     return (
-        "Extract only the clinically relevant chest xray abnormalities from the report.\n"
-        "Write one short sentence in English.\n"
+        "Extract only radiographic chest xray findings from the report.\n"
+        "Write one short sentence in English with a maximum of 15 words.\n"
         f"If there is no abnormality, write exactly: {NORMAL_SENTENCE}\n"
-        "Do not mention patient data, dates, comparisons, placeholders, or report metadata.\n"
+        "Mention only visible abnormalities and locations.\n"
+        "Do not mention recommendations, follow-up, clinical correlation, uncertainty management, patient data, dates, comparisons, placeholders, or report metadata.\n"
         "Do not invent findings.\n\n"
         f"Report:\n{report_text}\n\n"
         "Short abnormality sentence:"
@@ -72,8 +81,13 @@ def normalize_generation(text: str) -> str:
     lines = [line.strip(" -:\t\"'") for line in text.splitlines() if line.strip()]
     text = lines[0] if lines else text
     text = re.split(r"(?i)\b(report|short abnormality sentence)\s*:", text)[0].strip()
+    for pattern in FORBIDDEN_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip(" ,;:-")
     if not text:
         return NORMAL_SENTENCE
+    words = text.split()
+    if len(words) > 15:
+        text = " ".join(words[:15]).rstrip(" ,;:-")
     if text[-1] not in ".!?":
         text += "."
     return text
