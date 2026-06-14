@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .utils import ensure_dir, pick_device
 
 
-PROMPT_VERSION = "synthetic_anomaly_v2"
+PROMPT_VERSION = "synthetic_anomaly_v3"
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 NORMAL_SENTENCE = "No acute cardiopulmonary abnormality."
 FORBIDDEN_PATTERNS = [
@@ -22,6 +22,7 @@ FORBIDDEN_PATTERNS = [
     r"\bclinical correlation\b.*",
     r"\bif clinically indicated\b.*",
     r"\bshould be considered\b.*",
+    r"\b(?:tube|catheter|line|clip|clips|hardware|port|pacemaker|sternotomy wire|surgical suture)\b.*",
 ]
 
 
@@ -62,9 +63,10 @@ def clean_report_text(*parts: object) -> str:
 def build_prompt(report_text: str) -> str:
     return (
         "Extract only radiographic chest xray findings from the report.\n"
-        "Write one short sentence in English with a maximum of 15 words.\n"
+        "Write one complete noun phrase in English with a maximum of 12 words.\n"
         f"If there is no abnormality, write exactly: {NORMAL_SENTENCE}\n"
         "Mention only visible abnormalities and locations.\n"
+        "Do not mention tubes, catheters, lines, clips, ports, pacemakers, or hardware unless they are the primary finding.\n"
         "Do not mention recommendations, follow-up, clinical correlation, uncertainty management, patient data, dates, comparisons, placeholders, or report metadata.\n"
         "Do not invent findings.\n\n"
         f"Report:\n{report_text}\n\n"
@@ -86,8 +88,8 @@ def normalize_generation(text: str) -> str:
     if not text:
         return NORMAL_SENTENCE
     words = text.split()
-    if len(words) > 15:
-        text = " ".join(words[:15]).rstrip(" ,;:-")
+    if len(words) > 12:
+        text = " ".join(words[:12]).rstrip(" ,;:-")
     if text[-1] not in ".!?":
         text += "."
     return text

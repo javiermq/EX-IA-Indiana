@@ -137,8 +137,8 @@ En GPU:
 python -m src.indiana_xray.train_densenet \
   --concepts-tsv data/indiana/indiana_concepts.tsv \
   --out-dir runs/densenet_full \
-  --epochs 5 \
-  --batch-size 32 \
+  --epochs 10 \
+  --batch-size 8 \
   --device cuda
 ```
 
@@ -176,7 +176,7 @@ python -m src.indiana_xray.generate_gradcam \
   --concepts-tsv data/indiana/indiana_concepts.tsv \
   --checkpoint runs/densenet_full/best.pt \
   --out-dir runs/gradcam_full \
-  --decoder-epochs 3 \
+  --decoder-epochs 10 \
   --batch-size 32 \
   --device cuda
 ```
