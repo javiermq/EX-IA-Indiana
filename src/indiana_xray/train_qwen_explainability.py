@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +95,11 @@ def parse_args() -> argparse.Namespace:
 
 def clean_prediction(text: str) -> str:
     text = " ".join(text.replace("\n", " ").split()).strip()
+    text = re.sub(r"^[\s:;,.!?-]+", "", text)
+    text = re.sub(r"^icalcified\b", "calcified", text, flags=re.IGNORECASE)
+    text = re.sub(r"^icarcinoma\b", "carcinoma", text, flags=re.IGNORECASE)
+    text = re.sub(r"^icortical\b", "cortical", text, flags=re.IGNORECASE)
+    text = re.sub(r"^ilar\b", "hilar", text, flags=re.IGNORECASE)
     if not text:
         return "<empty>"
     if "." in text:

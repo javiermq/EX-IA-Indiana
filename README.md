@@ -48,6 +48,48 @@ data/indiana/hf_parquet/*.parquet
 
 El TSV maestro incluye rutas de imagen, secciones del informe, etiquetas disponibles, proyeccion y campos de grounding si existieran.
 
+## 2b. Preparar MIMIC-CXR-JPG
+
+MIMIC-CXR necesita estar descargado localmente. Este cargador asume la estructura habitual de MIMIC-CXR-JPG:
+
+```text
+MIMIC_JPG_ROOT/
+  files/p10/p10000032/s50414267/*.jpg
+  mimic-cxr-2.0.0-metadata.csv
+  mimic-cxr-2.0.0-split.csv
+  mimic-cxr-2.0.0-chexpert.csv
+```
+
+Y, si tienes los informes de texto:
+
+```text
+MIMIC_REPORTS_ROOT/
+  files/p10/p10000032/s50414267.txt
+```
+
+Comando compatible con el resto del pipeline:
+
+```bash
+python -m src.indiana_xray.prepare_mimic_cxr \
+  --mimic-jpg-root /path/to/mimic-cxr-jpg/2.0.0 \
+  --mimic-reports-root /path/to/mimic-cxr/2.0.0 \
+  --out-tsv data/mimic/mimic_master.tsv \
+  --synthetic-out-tsv data/mimic/mimic_synthetic.tsv \
+  --views PA AP \
+  --split all
+```
+
+Salidas:
+
+```text
+data/mimic/mimic_master.tsv
+data/mimic/mimic_synthetic.tsv
+```
+
+`mimic_master.tsv` mantiene el mismo esquema basico que Indiana: `image_path`, `image_id`, `projection`, `findings`, `impression`, `report_text`, `labels_available` y columnas `label_*`.
+
+`mimic_synthetic.tsv` usa directamente `IMPRESSION` como texto corto para `clip_text` y `next_token_text`. En MIMIC suele ser mejor que regenerar texto con Qwen, porque la impresion ya es una sintesis radiologica humana.
+
 ## 3. Extraer conceptos clinicos
 
 ```bash
@@ -121,6 +163,19 @@ next_token_text
 synthetic_model
 synthetic_prompt_version
 ```
+
+Alternativa controlada, recomendada si el next-token empieza a inventar variantes raras o no converge:
+
+```bash
+python -m src.indiana_xray.make_controlled_synthetic_text \
+  --input-tsv data/indiana/indiana_concepts.tsv \
+  --out-tsv data/indiana/indiana_synthetic_controlled.tsv \
+  --summary-out data/indiana/controlled_terms_summary.tsv \
+  --top-k 10 \
+  --max-terms-per-image 3
+```
+
+Esta version no usa generacion abierta. Primero cuenta los hallazgos mas comunes en `label_*`/`concepts`, mantiene un vocabulario cerrado y genera frases canonicas cortas como `Cardiomegaly and pleural effusion.`. Es menos expresiva, pero mucho mas estable para entrenar `clip_text` + `next_token_text`.
 
 Ejemplo de salida esperada:
 
