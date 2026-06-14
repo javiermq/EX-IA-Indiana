@@ -6,13 +6,14 @@ Esta fase se centra en:
 
 - preparar el dataset Indiana / IU-Xray;
 - extraer conceptos clinicos debiles desde informes;
+- generar un texto sintetico corto de anomalias con Qwen de forma offline;
 - entrenar DenseNet121 como extractor visual;
 - anadir un MLP residual ligero para clasificacion multilabel;
 - generar mapas Grad-CAM;
 - entrenar una rama ligera de atencion con decoder/deconvolucion;
 - obtener metricas de clasificacion y utilidad de heatmaps.
 
-Por ahora no se ejecuta generacion de informes, QA ni alineamiento con Qwen. `Qwen/Qwen2.5-1.5B` queda para una fase posterior.
+Por ahora no se ejecuta generacion de informes completa, QA ni alineamiento contrastivo con Qwen. Qwen se puede usar opcionalmente solo para crear una frase sintetica corta por informe.
 
 ## 1. Instalar dependencias
 
@@ -63,7 +64,58 @@ data/indiana/indiana_concepts.tsv
 
 Este archivo anade conceptos normalizados por imagen y columnas multilabel `label_*` para entrenamiento visual.
 
-## 4. Entrenar DenseNet121 + MLP residual
+## 4. Generar texto sintetico corto con Qwen
+
+Este paso es opcional. Sirve para crear una frase breve y densa con las anomalias relevantes de cada informe. Esa frase puede usarse mas adelante como texto para CLIP loss y next-token loss.
+
+El modelo recomendado para esta destilacion textual offline es `Qwen/Qwen2.5-1.5B-Instruct`, porque debe seguir una instruccion de resumen clinico. El alineamiento posterior puede seguir usando `Qwen/Qwen2.5-1.5B` congelado si se quiere mantener la arquitectura original.
+
+Prueba pequena:
+
+```bash
+python -m src.indiana_xray.generate_synthetic_text \
+  --input-tsv data/indiana/indiana_concepts.tsv \
+  --out-tsv data/indiana/indiana_synthetic_debug.tsv \
+  --model-id Qwen/Qwen2.5-1.5B-Instruct \
+  --limit 20 \
+  --batch-size 4 \
+  --device cuda \
+  --dtype float16
+```
+
+Ejecucion completa:
+
+```bash
+python -m src.indiana_xray.generate_synthetic_text \
+  --input-tsv data/indiana/indiana_concepts.tsv \
+  --out-tsv data/indiana/indiana_synthetic.tsv \
+  --model-id Qwen/Qwen2.5-1.5B-Instruct \
+  --batch-size 4 \
+  --device cuda \
+  --dtype float16 \
+  --resume
+```
+
+Columnas nuevas:
+
+```text
+report_text_clean
+synthetic_anomaly_text
+clip_text
+next_token_text
+synthetic_model
+synthetic_prompt_version
+```
+
+Ejemplo de salida esperada:
+
+```text
+synthetic_anomaly_text: Mild cardiomegaly with small left pleural effusion.
+clip_text: Chest xray: Mild cardiomegaly with small left pleural effusion.
+next_token_text: Mild cardiomegaly with small left pleural effusion.
+```
+
+## 5. Entrenar DenseNet121 + MLP residual
 
 En GPU:
 
@@ -103,7 +155,7 @@ Metricas principales:
 - `macro_f1`
 - AUC/AP por clase
 
-## 5. Generar Grad-CAM + decoder de atencion
+## 6. Generar Grad-CAM + decoder de atencion
 
 ```bash
 python -m src.indiana_xray.generate_gradcam \
@@ -132,7 +184,7 @@ Metricas principales:
 - `median_deletion_drop_top20`: mediana de esa caida.
 - `mean_refined_attention_mse`: distancia media entre atencion refinada y Grad-CAM.
 
-## 6. Ver resultados
+## 7. Ver resultados
 
 ```bash
 cat runs/densenet_full/metrics.json
@@ -148,6 +200,6 @@ Get-Content runs\gradcam_full\metrics.json
 
 ## Nota sobre Qwen
 
-`Qwen/Qwen2.5-1.5B` pesa varios GB y no se usa en este paso. La fase contrastiva queda pospuesta para no mezclar el diagnostico visual/atencional con la adaptacion del espacio textual.
+`Qwen/Qwen2.5-1.5B` y `Qwen/Qwen2.5-1.5B-Instruct` pesan varios GB. En este README, Qwen solo se usa de forma opcional para generar `indiana_synthetic.tsv` offline.
 
-Cuando se retome, la idea sera mantener Qwen congelado inicialmente, sin anadir tokens y sin generacion autoregresiva, usando solo embeddings textuales de conceptos clinicos.
+Cuando se retome la fase contrastiva, la idea sera mantener Qwen congelado inicialmente, sin anadir tokens. El texto de entrenamiento podra venir de `clip_text` y `next_token_text`.
