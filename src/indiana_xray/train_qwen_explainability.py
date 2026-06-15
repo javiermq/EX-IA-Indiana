@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import DEFAULT_MODEL_ID, TARGET_CONCEPTS
 from .dataset import image_transforms
-from .models import DenseNetClassifier, VisualProjector, clip_contrastive_loss
+from .models import DenseNetClassifier, clip_contrastive_loss
 from .utils import dump_json, ensure_dir, pick_device, set_seed
 
 
@@ -50,27 +50,54 @@ class SyntheticIndianaDataset(Dataset):
         }
 
 
-class VisualPrefixProjector(nn.Module):
+class RegionalVisualAdapter(nn.Module):
     def __init__(
         self,
-        visual_dim: int,
+        fmap_channels: int,
         qwen_dim: int,
         gradcam_dim: int,
         prefix_len: int = 8,
         hidden_dim: int = 1024,
+        num_heads: int = 8,
     ) -> None:
         super().__init__()
         self.prefix_len = prefix_len
-        self.net = nn.Sequential(
-            nn.Linear(visual_dim + gradcam_dim, hidden_dim),
+        self.gradcam_dim = gradcam_dim
+        self.region_proj = nn.Sequential(
+            nn.Linear(fmap_channels + 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, prefix_len * qwen_dim),
+            nn.Linear(hidden_dim, qwen_dim),
         )
+        self.query_tokens = nn.Parameter(torch.randn(prefix_len, qwen_dim) * 0.02)
+        self.reducer = nn.MultiheadAttention(qwen_dim, num_heads=num_heads, batch_first=True)
+        self.prefix_norm = nn.LayerNorm(qwen_dim)
+        self.clip_norm = nn.LayerNorm(qwen_dim)
 
-    def forward(self, visual: torch.Tensor, gradcam: torch.Tensor) -> torch.Tensor:
-        prefix = self.net(torch.cat([visual, gradcam], dim=-1))
-        return prefix.view(visual.size(0), self.prefix_len, -1)
+    def gradcam_maps(self, gradcam: torch.Tensor, fmap_size: tuple[int, int]) -> torch.Tensor:
+        half = self.gradcam_dim // 2
+        side = int(np.sqrt(half))
+        if self.gradcam_dim % 2 != 0 or side * side != half:
+            raise ValueError(f"Expected gradcam_dim to be 2*square, got {self.gradcam_dim}")
+        maps = gradcam.view(gradcam.size(0), 2, side, side)
+        if maps.shape[-2:] != fmap_size:
+            maps = F.interpolate(maps, size=fmap_size, mode="bilinear", align_corners=False)
+        return maps
+
+    def region_tokens(self, fmap: torch.Tensor, gradcam: torch.Tensor) -> torch.Tensor:
+        maps = self.gradcam_maps(gradcam, fmap.shape[-2:]).to(dtype=fmap.dtype)
+        regions = torch.cat([fmap, maps], dim=1).flatten(2).transpose(1, 2)
+        return self.region_proj(regions)
+
+    def clip_embedding(self, fmap: torch.Tensor, gradcam: torch.Tensor) -> torch.Tensor:
+        tokens = self.region_tokens(fmap, gradcam)
+        return F.normalize(self.clip_norm(tokens.mean(dim=1)).float(), dim=-1)
+
+    def prefix_tokens(self, fmap: torch.Tensor, gradcam: torch.Tensor) -> torch.Tensor:
+        tokens = self.region_tokens(fmap, gradcam)
+        queries = self.query_tokens.unsqueeze(0).expand(tokens.size(0), -1, -1)
+        prefix, _ = self.reducer(queries, tokens, tokens, need_weights=False)
+        return self.prefix_norm(prefix)
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-prompt", default=DEFAULT_DECODER_PROMPT)
     parser.add_argument("--eval-examples", type=int, default=3)
     parser.add_argument("--eval-max-new-tokens", type=int, default=32)
+    parser.add_argument("--eval-constrained-candidates", type=int, default=40)
+    parser.add_argument("--eval-free-generation", action="store_true")
     parser.add_argument("--eval-random-examples", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
@@ -188,14 +217,71 @@ def next_token_loss(
     return outputs.loss
 
 
+def build_prompted_inputs(
+    qwen: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prefix: torch.Tensor,
+    texts: list[str],
+    decoder_prompt: str,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prompt = decoder_prompt.strip() + " "
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "right"
+    try:
+        full_texts = [prompt + text for text in texts]
+        encoded = tokenizer(full_texts, padding=True, truncation=True, max_length=80, return_tensors="pt").to(device)
+        prompt_encoded = tokenizer([prompt] * len(texts), padding=False, truncation=True, max_length=80)
+    finally:
+        tokenizer.padding_side = old_padding_side
+
+    token_emb = qwen.get_input_embeddings()(encoded["input_ids"])
+    prefix = prefix.to(dtype=token_emb.dtype)
+    inputs_embeds = torch.cat([prefix, token_emb], dim=1)
+    prefix_mask = torch.ones(prefix.shape[:2], dtype=encoded["attention_mask"].dtype, device=device)
+    attention_mask = torch.cat([prefix_mask, encoded["attention_mask"]], dim=1)
+    prefix_labels = torch.full(prefix.shape[:2], -100, dtype=torch.long, device=device)
+    token_labels = encoded["input_ids"].clone()
+    for i, prompt_ids in enumerate(prompt_encoded["input_ids"]):
+        token_labels[i, : min(len(prompt_ids), token_labels.size(1))] = -100
+    token_labels = token_labels.masked_fill(encoded["attention_mask"] == 0, -100)
+    labels = torch.cat([prefix_labels, token_labels], dim=1)
+    labels = labels.masked_fill(attention_mask == 0, -100)
+    return inputs_embeds, attention_mask, labels
+
+
+@torch.no_grad()
+def next_token_nll_per_sample(
+    qwen: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prefix: torch.Tensor,
+    texts: list[str],
+    decoder_prompt: str,
+    device: torch.device,
+) -> torch.Tensor:
+    inputs_embeds, attention_mask, labels = build_prompted_inputs(
+        qwen, tokenizer, prefix, texts, decoder_prompt, device
+    )
+    logits = qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask, use_cache=False).logits
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    flat_loss = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(shift_labels.shape)
+    valid = shift_labels.ne(-100)
+    return flat_loss.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+
 def run_epoch(
     train: bool,
     loader: DataLoader,
     densenet: DenseNetClassifier,
     qwen: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    visual_projector: VisualProjector,
-    prefix_projector: VisualPrefixProjector,
+    visual_adapter: RegionalVisualAdapter,
     gradcam_mapping: dict[str, np.ndarray],
     gradcam_dim: int,
     log_temperature: torch.Tensor,
@@ -203,8 +289,7 @@ def run_epoch(
     args: argparse.Namespace,
     device: torch.device,
 ) -> dict[str, float]:
-    visual_projector.train(train)
-    prefix_projector.train(train)
+    visual_adapter.train(train)
     losses: list[float] = []
     clip_losses: list[float] = []
     nt_losses: list[float] = []
@@ -214,14 +299,14 @@ def run_epoch(
         clip_texts = list(batch["clip_text"])
         next_texts = list(batch["next_token_text"])
         with torch.no_grad():
-            _, visual, _ = densenet(images)
+            _, _, fmap = densenet(images)
             gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
             text_emb = qwen_text_embeddings(qwen, tokenizer, clip_texts, device)
 
         with torch.set_grad_enabled(train):
-            image_emb = visual_projector(visual.float(), gradcam)
+            image_emb = visual_adapter.clip_embedding(fmap.float(), gradcam)
             clip_loss = clip_contrastive_loss(image_emb, text_emb, log_temperature)
-            prefix = prefix_projector(visual.float(), gradcam)
+            prefix = visual_adapter.prefix_tokens(fmap.float(), gradcam)
             nt_loss = next_token_loss(qwen, tokenizer, prefix, next_texts, args.decoder_prompt, device)
             loss = args.clip_weight * clip_loss + args.next_token_weight * nt_loss
             if train:
@@ -246,20 +331,20 @@ def retrieval_metrics(
     densenet: DenseNetClassifier,
     qwen: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    visual_projector: VisualProjector,
+    visual_adapter: RegionalVisualAdapter,
     gradcam_mapping: dict[str, np.ndarray],
     gradcam_dim: int,
     device: torch.device,
 ) -> dict[str, float]:
-    visual_projector.eval()
+    visual_adapter.eval()
     image_embs = []
     text_embs = []
     for batch in loader:
         images = batch["image"].to(device)
         texts = list(batch["clip_text"])
-        _, visual, _ = densenet(images)
+        _, _, fmap = densenet(images)
         gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
-        image_embs.append(visual_projector(visual.float(), gradcam).cpu())
+        image_embs.append(visual_adapter.clip_embedding(fmap.float(), gradcam).cpu())
         text_embs.append(qwen_text_embeddings(qwen, tokenizer, texts, device).cpu())
     image_emb = torch.cat(image_embs)
     text_emb = torch.cat(text_embs)
@@ -306,51 +391,97 @@ def make_eval_example_loader(
     return DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=0)
 
 
+def candidate_texts_from_df(df: pd.DataFrame, max_candidates: int) -> list[str]:
+    if max_candidates <= 0 or "next_token_text" not in df.columns:
+        return []
+    texts = df["next_token_text"].astype(str).str.strip()
+    texts = texts[texts.ne("")]
+    texts = texts[~texts.str.contains(r"[^\x00-\x7F]", regex=True)]
+    ranked = texts.value_counts().head(max_candidates).index.tolist()
+    normal = "No acute cardiopulmonary abnormality."
+    if normal in set(texts) and normal not in ranked:
+        ranked = [normal] + ranked[: max_candidates - 1]
+    return ranked
+
+
+@torch.no_grad()
+def constrained_predictions(
+    qwen: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prefix: torch.Tensor,
+    candidates: list[str],
+    decoder_prompt: str,
+    device: torch.device,
+    chunk_size: int = 32,
+) -> list[str]:
+    if not candidates:
+        return []
+    predictions: list[str] = []
+    for i in range(prefix.size(0)):
+        row_prefix = prefix[i : i + 1]
+        losses = []
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start : start + chunk_size]
+            repeated_prefix = row_prefix.expand(len(chunk), -1, -1).contiguous()
+            losses.append(next_token_nll_per_sample(qwen, tokenizer, repeated_prefix, chunk, decoder_prompt, device))
+        all_losses = torch.cat(losses)
+        predictions.append(candidates[int(torch.argmin(all_losses).item())])
+    return predictions
+
+
 @torch.no_grad()
 def print_eval_examples(
     loader: DataLoader | None,
     densenet: DenseNetClassifier,
     qwen: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    prefix_projector: VisualPrefixProjector,
+    visual_adapter: RegionalVisualAdapter,
     gradcam_mapping: dict[str, np.ndarray],
     gradcam_dim: int,
     device: torch.device,
     max_examples: int,
     max_new_tokens: int,
     decoder_prompt: str,
+    candidates: list[str],
+    free_generation: bool,
 ) -> None:
     if max_examples <= 0 or loader is None:
         return
-    prefix_projector.eval()
+    visual_adapter.eval()
     shown = 0
     print("eval_examples:")
     for batch in loader:
         images = batch["image"].to(device)
-        _, visual, _ = densenet(images)
+        _, _, fmap = densenet(images)
         gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
-        prefix = prefix_projector(visual.float(), gradcam).to(dtype=qwen.get_input_embeddings().weight.dtype)
-        prompt_texts = [decoder_prompt.strip() + " "] * prefix.size(0)
-        encoded_prompt = tokenizer(prompt_texts, padding=True, truncation=True, max_length=32, return_tensors="pt").to(device)
-        prompt_emb = qwen.get_input_embeddings()(encoded_prompt["input_ids"])
-        prompt_emb = prompt_emb.to(dtype=prefix.dtype)
-        inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
-        prefix_mask = torch.ones(prefix.shape[:2], dtype=encoded_prompt["attention_mask"].dtype, device=device)
-        attention_mask = torch.cat([prefix_mask, encoded_prompt["attention_mask"]], dim=1)
-        generated = qwen.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-        decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
-        for image_id, gt, pred in zip(batch["image_id"], batch["next_token_text"], decoded):
+        prefix = visual_adapter.prefix_tokens(fmap.float(), gradcam).to(dtype=qwen.get_input_embeddings().weight.dtype)
+        constrained = constrained_predictions(qwen, tokenizer, prefix, candidates, decoder_prompt, device)
+        decoded = [""] * len(batch["image_id"])
+        if free_generation:
+            prompt_texts = [decoder_prompt.strip() + " "] * prefix.size(0)
+            encoded_prompt = tokenizer(prompt_texts, padding=True, truncation=True, max_length=32, return_tensors="pt").to(device)
+            prompt_emb = qwen.get_input_embeddings()(encoded_prompt["input_ids"])
+            prompt_emb = prompt_emb.to(dtype=prefix.dtype)
+            inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
+            prefix_mask = torch.ones(prefix.shape[:2], dtype=encoded_prompt["attention_mask"].dtype, device=device)
+            attention_mask = torch.cat([prefix_mask, encoded_prompt["attention_mask"]], dim=1)
+            generated = qwen.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        for i, (image_id, gt) in enumerate(zip(batch["image_id"], batch["next_token_text"])):
             print(f"  image_id: {image_id}")
             print(f"    gt:   {gt}")
-            print(f"    pred: {clean_prediction(pred)}")
+            if constrained:
+                print(f"    pred: {constrained[i]}")
+            if free_generation:
+                print(f"    free: {clean_prediction(decoded[i])}")
             shown += 1
             if shown >= max_examples:
                 return
@@ -376,6 +507,7 @@ def main() -> None:
         batch_size=min(args.batch_size, max(1, args.eval_examples)),
         seed=args.seed,
     )
+    eval_candidates = candidate_texts_from_df(train_ds.df, args.eval_constrained_candidates)
 
     densenet = load_densenet(args.densenet_checkpoint, device)
     gradcam_mapping, gradcam_dim = load_gradcam_embeddings(args.gradcam_dir)
@@ -389,13 +521,8 @@ def main() -> None:
     qwen.requires_grad_(False)
     qwen.config.use_cache = False
 
-    visual_projector = VisualProjector(
-        visual_dim=densenet.encoder.out_dim,
-        text_dim=int(qwen.config.hidden_size),
-        gradcam_dim=gradcam_dim,
-    ).to(device)
-    prefix_projector = VisualPrefixProjector(
-        visual_dim=densenet.encoder.out_dim,
+    visual_adapter = RegionalVisualAdapter(
+        fmap_channels=densenet.encoder.out_dim,
         qwen_dim=int(qwen.config.hidden_size),
         gradcam_dim=gradcam_dim,
         prefix_len=args.prefix_len,
@@ -403,7 +530,7 @@ def main() -> None:
     log_temperature = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32, device=device))
 
     optimizer = torch.optim.AdamW(
-        list(visual_projector.parameters()) + list(prefix_projector.parameters()) + [log_temperature],
+        list(visual_adapter.parameters()) + [log_temperature],
         lr=args.lr,
         weight_decay=1e-4,
     )
@@ -417,8 +544,7 @@ def main() -> None:
             densenet,
             qwen,
             tokenizer,
-            visual_projector,
-            prefix_projector,
+            visual_adapter,
             gradcam_mapping,
             gradcam_dim,
             log_temperature,
@@ -432,8 +558,7 @@ def main() -> None:
             densenet,
             qwen,
             tokenizer,
-            visual_projector,
-            prefix_projector,
+            visual_adapter,
             gradcam_mapping,
             gradcam_dim,
             log_temperature,
@@ -446,7 +571,7 @@ def main() -> None:
             densenet,
             qwen,
             tokenizer,
-            visual_projector,
+            visual_adapter,
             gradcam_mapping,
             gradcam_dim,
             device,
@@ -463,27 +588,29 @@ def main() -> None:
             densenet,
             qwen,
             tokenizer,
-            prefix_projector,
+            visual_adapter,
             gradcam_mapping,
             gradcam_dim,
             device,
             args.eval_examples,
             args.eval_max_new_tokens,
             args.decoder_prompt,
+            eval_candidates,
+            args.eval_free_generation,
         )
         score = retrieval["retrieval_r5"]
         if score > best_score:
             best_score = score
             torch.save(
                 {
-                    "visual_projector_state": visual_projector.state_dict(),
-                    "prefix_projector_state": prefix_projector.state_dict(),
+                    "visual_adapter_state": visual_adapter.state_dict(),
                     "log_temperature": float(log_temperature.detach().cpu()),
                     "epoch": epoch,
                     "metrics": record,
                     "model_id": args.model_id,
                     "prefix_len": args.prefix_len,
                     "gradcam_dim": gradcam_dim,
+                    "adapter": "regional_7x7_dense_gradcam_refined",
                 },
                 out_dir / "best.pt",
             )

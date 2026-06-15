@@ -129,6 +129,7 @@ python -m src.indiana_xray.train_qwen_explainability \
   --next-token-weight 0.5 \
   --prefix-len 8 \
   --decoder-prompt "Chest xray finding in English:" \
+  --eval-constrained-candidates 40 \
   --eval-examples 6 \
   --eval-random-examples
 ```
@@ -315,20 +316,35 @@ Metricas principales:
 
 ## 7. Entrenar Qwen para explicabilidad
 
-Este paso usa `indiana_synthetic_v4.tsv`, DenseNet y Grad-CAM para aprender una conexion explicativa visual-textual. Qwen queda congelado: no se anaden tokens y no se genera texto durante el entrenamiento.
+Este paso usa el TSV sintetico, DenseNet y Grad-CAM para aprender una conexion explicativa visual-textual. Qwen queda congelado: no se anaden tokens y no se entrena el LLM.
 
 Se entrenan solo:
 
-- proyector visual para CLIP loss;
-- proyector de prefijo visual para next-token loss;
+- adaptador visual regional compartido para CLIP loss y next-token loss;
 - temperatura contrastiva.
+
+El adaptador regional recibe:
+
+```text
+DenseNet fmap:      1024 x 7 x 7
+Grad-CAM pooled:       1 x 7 x 7
+Refined attention:     1 x 7 x 7
+```
+
+Forma 49 regiones de 1026 dimensiones y las proyecta al espacio hidden de Qwen:
+
+```text
+49 x 1026 -> 49 x qwen_hidden_size
+```
+
+Para CLIP hace pooling de esos tokens regionales a un embedding visual. Para next-token reduce los 49 tokens a `prefix_len` pseudo-tokens visuales mediante queries aprendidas.
 
 ```bash
 python -m src.indiana_xray.train_qwen_explainability \
-  --synthetic-tsv data/indiana/indiana_synthetic_v4_qwen7b.tsv \
+  --synthetic-tsv data/indiana/indiana_synthetic_v5_keywords_qwen7b.tsv \
   --densenet-checkpoint runs/densenet_full_e10/best.pt \
   --gradcam-dir runs/gradcam_full_e10 \
-  --out-dir runs/qwen_explainability_e10 \
+  --out-dir runs/qwen_explainability_v5_regional_e20 \
   --model-id Qwen/Qwen2.5-1.5B \
   --epochs 20 \
   --batch-size 2 \
@@ -338,11 +354,12 @@ python -m src.indiana_xray.train_qwen_explainability \
   --next-token-weight 0.5 \
   --prefix-len 8 \
   --decoder-prompt "Chest xray finding in English:" \
+  --eval-constrained-candidates 40 \
   --eval-examples 6 \
   --eval-random-examples
 ```
 
-Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`.
+Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`. Los ejemplos de eval usan por defecto una seleccion constrained entre las 40 frases mas frecuentes del train; para ver tambien la generacion libre, anade `--eval-free-generation`.
 
 Salidas:
 
