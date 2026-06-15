@@ -21,6 +21,9 @@ from .models import DenseNetClassifier, VisualProjector, clip_contrastive_loss
 from .utils import dump_json, ensure_dir, pick_device, set_seed
 
 
+DEFAULT_DECODER_PROMPT = "Chest xray finding in English:"
+
+
 class SyntheticIndianaDataset(Dataset):
     def __init__(self, tsv_path: Path, indices: list[int], train: bool, image_size: int = 224) -> None:
         self.df = pd.read_csv(tsv_path, sep="\t").fillna("")
@@ -84,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix-len", type=int, default=8)
     parser.add_argument("--clip-weight", type=float, default=1.0)
     parser.add_argument("--next-token-weight", type=float, default=0.25)
+    parser.add_argument("--decoder-prompt", default=DEFAULT_DECODER_PROMPT)
     parser.add_argument("--eval-examples", type=int, default=3)
     parser.add_argument("--eval-max-new-tokens", type=int, default=32)
     parser.add_argument("--eval-random-examples", action="store_true")
@@ -102,6 +106,8 @@ def clean_prediction(text: str) -> str:
     text = re.sub(r"^ilar\b", "hilar", text, flags=re.IGNORECASE)
     if not text:
         return "<empty>"
+    if re.search(r"[^\x00-\x7F]", text):
+        return "<non-english>"
     if "." in text:
         text = text.split(".")[0].strip() + "."
     return text
@@ -153,17 +159,30 @@ def next_token_loss(
     tokenizer: AutoTokenizer,
     prefix: torch.Tensor,
     texts: list[str],
+    decoder_prompt: str,
     device: torch.device,
 ) -> torch.Tensor:
-    encoded = tokenizer(texts, padding=True, truncation=True, max_length=64, return_tensors="pt").to(device)
+    prompt = decoder_prompt.strip() + " "
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "right"
+    try:
+        full_texts = [prompt + text for text in texts]
+        encoded = tokenizer(full_texts, padding=True, truncation=True, max_length=80, return_tensors="pt").to(device)
+        prompt_encoded = tokenizer([prompt] * len(texts), padding=False, truncation=True, max_length=80)
+    finally:
+        tokenizer.padding_side = old_padding_side
+
     token_emb = qwen.get_input_embeddings()(encoded["input_ids"])
     prefix = prefix.to(dtype=token_emb.dtype)
     inputs_embeds = torch.cat([prefix, token_emb], dim=1)
     prefix_mask = torch.ones(prefix.shape[:2], dtype=encoded["attention_mask"].dtype, device=device)
     attention_mask = torch.cat([prefix_mask, encoded["attention_mask"]], dim=1)
     prefix_labels = torch.full(prefix.shape[:2], -100, dtype=torch.long, device=device)
-    labels = torch.cat([prefix_labels, encoded["input_ids"]], dim=1)
-    labels[:, prefix.shape[1]] = -100
+    token_labels = encoded["input_ids"].clone()
+    for i, prompt_ids in enumerate(prompt_encoded["input_ids"]):
+        token_labels[i, : min(len(prompt_ids), token_labels.size(1))] = -100
+    token_labels = token_labels.masked_fill(encoded["attention_mask"] == 0, -100)
+    labels = torch.cat([prefix_labels, token_labels], dim=1)
     labels = labels.masked_fill(attention_mask == 0, -100)
     outputs = qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, use_cache=False)
     return outputs.loss
@@ -203,7 +222,7 @@ def run_epoch(
             image_emb = visual_projector(visual.float(), gradcam)
             clip_loss = clip_contrastive_loss(image_emb, text_emb, log_temperature)
             prefix = prefix_projector(visual.float(), gradcam)
-            nt_loss = next_token_loss(qwen, tokenizer, prefix, next_texts, device)
+            nt_loss = next_token_loss(qwen, tokenizer, prefix, next_texts, args.decoder_prompt, device)
             loss = args.clip_weight * clip_loss + args.next_token_weight * nt_loss
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -299,6 +318,7 @@ def print_eval_examples(
     device: torch.device,
     max_examples: int,
     max_new_tokens: int,
+    decoder_prompt: str,
 ) -> None:
     if max_examples <= 0 or loader is None:
         return
@@ -310,9 +330,15 @@ def print_eval_examples(
         _, visual, _ = densenet(images)
         gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
         prefix = prefix_projector(visual.float(), gradcam).to(dtype=qwen.get_input_embeddings().weight.dtype)
-        attention_mask = torch.ones(prefix.shape[:2], dtype=torch.long, device=device)
+        prompt_texts = [decoder_prompt.strip() + " "] * prefix.size(0)
+        encoded_prompt = tokenizer(prompt_texts, padding=True, truncation=True, max_length=32, return_tensors="pt").to(device)
+        prompt_emb = qwen.get_input_embeddings()(encoded_prompt["input_ids"])
+        prompt_emb = prompt_emb.to(dtype=prefix.dtype)
+        inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
+        prefix_mask = torch.ones(prefix.shape[:2], dtype=encoded_prompt["attention_mask"].dtype, device=device)
+        attention_mask = torch.cat([prefix_mask, encoded_prompt["attention_mask"]], dim=1)
         generated = qwen.generate(
-            inputs_embeds=prefix,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -443,6 +469,7 @@ def main() -> None:
             device,
             args.eval_examples,
             args.eval_max_new_tokens,
+            args.decoder_prompt,
         )
         score = retrieval["retrieval_r5"]
         if score > best_score:

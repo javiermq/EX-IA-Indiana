@@ -90,6 +90,51 @@ data/mimic/mimic_synthetic.tsv
 
 `mimic_synthetic.tsv` usa directamente `IMPRESSION` como texto corto para `clip_text` y `next_token_text`. En MIMIC suele ser mejor que regenerar texto con Qwen, porque la impresion ya es una sintesis radiologica humana.
 
+### Pipeline MIMIC completo
+
+Para probar el otro dataset de principio a fin:
+
+```bash
+python -m src.indiana_xray.prepare_mimic_cxr \
+  --mimic-jpg-root /path/to/mimic-cxr-jpg/2.0.0 \
+  --mimic-reports-root /path/to/mimic-cxr/2.0.0 \
+  --out-tsv data/mimic/mimic_master.tsv \
+  --synthetic-out-tsv data/mimic/mimic_synthetic.tsv \
+  --views PA AP \
+  --split all && \
+python -m src.indiana_xray.train_densenet \
+  --concepts-tsv data/mimic/mimic_master.tsv \
+  --out-dir runs/mimic_densenet_e10 \
+  --epochs 10 \
+  --batch-size 8 \
+  --device cuda && \
+python -m src.indiana_xray.generate_gradcam \
+  --concepts-tsv data/mimic/mimic_master.tsv \
+  --checkpoint runs/mimic_densenet_e10/best.pt \
+  --out-dir runs/mimic_gradcam_e10 \
+  --decoder-epochs 10 \
+  --batch-size 8 \
+  --device cuda && \
+python -m src.indiana_xray.train_qwen_explainability \
+  --synthetic-tsv data/mimic/mimic_synthetic.tsv \
+  --densenet-checkpoint runs/mimic_densenet_e10/best.pt \
+  --gradcam-dir runs/mimic_gradcam_e10 \
+  --out-dir runs/mimic_qwen_explainability_prompted_e20 \
+  --model-id Qwen/Qwen2.5-1.5B \
+  --epochs 20 \
+  --batch-size 2 \
+  --device cuda \
+  --dtype float16 \
+  --clip-weight 0.5 \
+  --next-token-weight 0.5 \
+  --prefix-len 8 \
+  --decoder-prompt "Chest xray finding in English:" \
+  --eval-examples 6 \
+  --eval-random-examples
+```
+
+Si aparece OOM en Qwen, baja `--batch-size 2` a `--batch-size 1`. Para una prueba rapida antes de lanzar todo MIMIC, anade `--max-studies 2000` al comando `prepare_mimic_cxr`.
+
 ## 3. Extraer conceptos clinicos
 
 ```bash
@@ -292,6 +337,7 @@ python -m src.indiana_xray.train_qwen_explainability \
   --clip-weight 0.5 \
   --next-token-weight 0.5 \
   --prefix-len 8 \
+  --decoder-prompt "Chest xray finding in English:" \
   --eval-examples 6 \
   --eval-random-examples
 ```
