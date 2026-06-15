@@ -118,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-examples", type=int, default=3)
     parser.add_argument("--eval-max-new-tokens", type=int, default=32)
     parser.add_argument("--eval-constrained-candidates", type=int, default=40)
+    parser.add_argument("--no-eval-prior-correction", action="store_true")
     parser.add_argument("--eval-free-generation", action="store_true")
     parser.add_argument("--eval-random-examples", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -413,6 +414,7 @@ def constrained_predictions(
     decoder_prompt: str,
     device: torch.device,
     chunk_size: int = 32,
+    prior_correction: bool = True,
 ) -> list[str]:
     if not candidates:
         return []
@@ -423,9 +425,14 @@ def constrained_predictions(
         for start in range(0, len(candidates), chunk_size):
             chunk = candidates[start : start + chunk_size]
             repeated_prefix = row_prefix.expand(len(chunk), -1, -1).contiguous()
-            losses.append(next_token_nll_per_sample(qwen, tokenizer, repeated_prefix, chunk, decoder_prompt, device))
-        all_losses = torch.cat(losses)
-        predictions.append(candidates[int(torch.argmin(all_losses).item())])
+            conditional = next_token_nll_per_sample(qwen, tokenizer, repeated_prefix, chunk, decoder_prompt, device)
+            if prior_correction:
+                null_prefix = torch.zeros_like(repeated_prefix)
+                prior = next_token_nll_per_sample(qwen, tokenizer, null_prefix, chunk, decoder_prompt, device)
+                conditional = conditional - prior
+            losses.append(conditional)
+        scores = torch.cat(losses)
+        predictions.append(candidates[int(torch.argmin(scores).item())])
     return predictions
 
 
@@ -444,6 +451,7 @@ def print_eval_examples(
     decoder_prompt: str,
     candidates: list[str],
     free_generation: bool,
+    prior_correction: bool,
 ) -> None:
     if max_examples <= 0 or loader is None:
         return
@@ -455,7 +463,15 @@ def print_eval_examples(
         _, _, fmap = densenet(images)
         gradcam = batch_gradcam(batch, gradcam_mapping, gradcam_dim, device)
         prefix = visual_adapter.prefix_tokens(fmap.float(), gradcam).to(dtype=qwen.get_input_embeddings().weight.dtype)
-        constrained = constrained_predictions(qwen, tokenizer, prefix, candidates, decoder_prompt, device)
+        constrained = constrained_predictions(
+            qwen,
+            tokenizer,
+            prefix,
+            candidates,
+            decoder_prompt,
+            device,
+            prior_correction=prior_correction,
+        )
         decoded = [""] * len(batch["image_id"])
         if free_generation:
             prompt_texts = [decoder_prompt.strip() + " "] * prefix.size(0)
@@ -597,6 +613,7 @@ def main() -> None:
             args.decoder_prompt,
             eval_candidates,
             args.eval_free_generation,
+            not args.no_eval_prior_correction,
         )
         score = retrieval["retrieval_r5"]
         if score > best_score:

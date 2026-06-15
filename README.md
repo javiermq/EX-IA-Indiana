@@ -359,7 +359,7 @@ python -m src.indiana_xray.train_qwen_explainability \
   --eval-random-examples
 ```
 
-Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`. Los ejemplos de eval usan por defecto una seleccion constrained entre las 40 frases mas frecuentes del train; para ver tambien la generacion libre, anade `--eval-free-generation`.
+Si hay OOM, baja `--batch-size` a `1`. Si el next-token pesa demasiado frente a CLIP, baja `--next-token-weight` a `0.1`. Los ejemplos de eval usan por defecto una seleccion constrained entre las 40 frases mas frecuentes del train con correccion de prior linguistico; para ver tambien la generacion libre, anade `--eval-free-generation`. Para desactivar esa correccion, anade `--no-eval-prior-correction`.
 
 Salidas:
 
